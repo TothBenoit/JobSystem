@@ -7,6 +7,7 @@
 
 namespace Job
 {
+    // Implementation from WickedEngine blog
     template <typename T, size_t capacity>
     class ThreadSafeRingBuffer
     {
@@ -57,7 +58,6 @@ namespace Job
     uint32_t numThreads = 0;
     ThreadSafeRingBuffer<JobInstance, 256> jobPool;
 
-
     std::mutex waitingJobsMutex;
     std::map < Counter*, std::vector<std::pair<JobInstance, uint32_t>>> waitingJobs;
 
@@ -70,6 +70,41 @@ namespace Job
     {
         wakeCondition.notify_one();
         std::this_thread::yield();
+    }
+
+    void UpdateWaitingJob(Counter * pCounter)
+    {
+        waitingJobsMutex.lock();
+        auto it = waitingJobs.find(pCounter);
+        if (it != waitingJobs.end())
+        {
+            std::vector < std::pair<JobInstance, uint32_t>>& jobs{ it->second };
+            auto itJobs = jobs.begin();
+            for (; itJobs != jobs.end(); )
+            {
+                auto& [jobInstance, fenceValue] = *itJobs;
+                if (fenceValue <= pCounter->load())
+                {
+                    while (!jobPool.push_back(jobInstance)) { poll(); }
+                    if (itJobs + 1 == jobs.end())
+                    {
+                        jobs.pop_back();
+                        break;
+                    }
+
+                    *itJobs = jobs.back();
+                    jobs.pop_back();
+                    wakeCondition.notify_one();
+                    continue;
+                }
+                ++itJobs;
+            }
+            if (it->second.empty())
+            {
+                waitingJobs.erase(it);
+            }
+        }
+        waitingJobsMutex.unlock();
     }
 
     void Initialize()
@@ -92,37 +127,9 @@ namespace Job
                     {
                         (job.m_executable)();
                         (*job.m_pCounter).fetch_add(1);
-                        waitingJobsMutex.lock();
-                        auto it = waitingJobs.find(job.m_pCounter);
-                        if (it != waitingJobs.end())
-                        {
-                            std::vector < std::pair<JobInstance, uint32_t>>& jobs{ it->second };
-                            auto itJobs = jobs.begin();
-                            for (;itJobs != jobs.end(); )
-                            {
-                                auto& [jobInstance, fenceValue] = *itJobs;
-                                if (fenceValue <= job.m_pCounter->load())
-                                {
-                                    while (!jobPool.push_back(jobInstance)) { poll(); }
-                                    if (itJobs + 1 == jobs.end())
-                                    {
-                                        jobs.pop_back();
-                                        break;
-                                    }
+                        
+                        UpdateWaitingJob(job.m_pCounter);
 
-                                    *itJobs = jobs.back();
-                                    jobs.pop_back();
-                                    continue;
-                                }
-                                ++itJobs;
-                            }
-                            if (it->second.empty())
-                            {
-                                waitingJobs.erase(it);
-                            }
-                        }
-                        waitingJobsMutex.unlock();
-                        wakeCondition.notify_one();
                         finishedLabel.fetch_add(1);
                     }
                     else
@@ -156,7 +163,7 @@ namespace Job
         m_fence.store(m_totalJob);
     }
 
-    void JobBuilder::DispatchJobInternal(std::function<void()> job)
+    void JobBuilder::DispatchJobInternal(const std::function<void()>& job)
     {
         currentLabel.fetch_add(1);
 

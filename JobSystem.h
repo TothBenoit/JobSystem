@@ -2,6 +2,14 @@
 #include <functional>
 #include <atomic>   
 
+/*************************/
+// TODO :
+// - Use fibers
+// - Make it lockless
+// - Add different priority queues
+// - Add synchronization between different job chains
+/*************************/
+
 namespace Job
 {
     void Initialize();
@@ -21,11 +29,11 @@ namespace Job
         JobBuilder();
 
         template<Fence fenceType = Fence::With>
-        void DispatchJob(std::function<void()> job);
+        void DispatchJob(const std::function<void()>& job);
         void DispatchExplicitFence();
 
     private:
-        void DispatchJobInternal(std::function<void()> job);
+        void DispatchJobInternal(const std::function<void()>& job);
 
     private:
         Counter m_totalJob{ 0 };
@@ -35,7 +43,7 @@ namespace Job
     };
 
     template<Fence fenceType>
-    void JobBuilder::DispatchJob(std::function<void()> job)
+    void JobBuilder::DispatchJob(const std::function<void()>& job)
     {
         if constexpr (fenceType == Fence::With)
         {
