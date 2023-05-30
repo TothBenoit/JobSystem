@@ -2,11 +2,37 @@
 
 #include <thread>   
 #include <condition_variable> 
-#include <array>
+#include <emmintrin.h>
 #include <map>
 
 namespace Job
 {
+    class SpinLock
+    {
+    public:
+        void lock()
+        {
+            while (true)
+            {
+                while (m_lock)
+                {
+                    _mm_pause();
+                }
+
+                if (!m_lock.exchange(true))
+                    break;
+            }
+        }
+
+        void unlock()
+        {
+            m_lock.store(false);
+        }
+
+    private:
+        std::atomic<bool> m_lock{ false };
+    };
+
     // Implementation from WickedEngine blog
     template <typename T, size_t capacity>
     class ThreadSafeRingBuffer
@@ -46,7 +72,7 @@ namespace Job
         T data[capacity];
         size_t head = 0;
         size_t tail = 0;
-        std::mutex lock;
+        SpinLock lock;
     };
 
     struct JobInstance
@@ -58,23 +84,20 @@ namespace Job
     uint32_t numThreads = 0;
     ThreadSafeRingBuffer<JobInstance, 256> jobPool;
 
-    std::mutex waitingJobsMutex;
+    SpinLock waitingJobsLock;
     std::map < Counter*, std::vector<std::pair<JobInstance, uint32_t>>> waitingJobs;
 
-    std::condition_variable wakeCondition;
-    std::mutex wakeMutex;
     std::atomic<uint64_t> currentLabel = 0;
     std::atomic<uint64_t> finishedLabel;
    
     inline void poll()
     {
-        wakeCondition.notify_one();
         std::this_thread::yield();
     }
 
     void UpdateWaitingJob(Counter * pCounter)
     {
-        waitingJobsMutex.lock();
+        waitingJobsLock.lock();
         auto it = waitingJobs.find(pCounter);
         if (it != waitingJobs.end())
         {
@@ -85,7 +108,7 @@ namespace Job
                 auto& [jobInstance, fenceValue] = *itJobs;
                 if (fenceValue <= pCounter->load())
                 {
-                    while (!jobPool.push_back(jobInstance)) { poll(); }
+                    while (!jobPool.push_back(jobInstance)) {}
                     if (itJobs + 1 == jobs.end())
                     {
                         jobs.pop_back();
@@ -94,7 +117,6 @@ namespace Job
 
                     *itJobs = jobs.back();
                     jobs.pop_back();
-                    wakeCondition.notify_one();
                     continue;
                 }
                 ++itJobs;
@@ -104,7 +126,7 @@ namespace Job
                 waitingJobs.erase(it);
             }
         }
-        waitingJobsMutex.unlock();
+        waitingJobsLock.unlock();
     }
 
     void Initialize()
@@ -134,8 +156,7 @@ namespace Job
                     }
                     else
                     {
-                        std::unique_lock<std::mutex> lock(wakeMutex);
-                        wakeCondition.wait(lock);
+                        poll();
                     }
                 }
 
@@ -169,15 +190,13 @@ namespace Job
 
         if (m_fence > m_jobFinished)
         {
-            waitingJobsMutex.lock();
+            waitingJobsLock.lock();
             waitingJobs[&m_jobFinished].emplace_back(JobInstance{ job, &m_jobFinished }, m_fence.load());
-            waitingJobsMutex.unlock();
+            waitingJobsLock.unlock();
         }
         else
         {
             while (!jobPool.push_back(JobInstance{ job, &m_jobFinished })) { poll(); }
         }
-
-        wakeCondition.notify_one();
     }
 }
