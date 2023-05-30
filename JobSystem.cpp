@@ -1,39 +1,17 @@
 #include "JobSystem.h"
 
 #include <thread>   
-#include <condition_variable> 
 #include <emmintrin.h>
-#include <map>
+#include <unordered_map>
 
 namespace Job
 {
-    class SpinLock
-    {
-    public:
-        void lock()
-        {
-            while (true)
-            {
-                while (m_lock)
-                {
-                    _mm_pause();
-                }
+    class CounterInstance;
 
-                if (!m_lock.exchange(true))
-                    break;
-            }
-        }
+    void WorkerMainLoop();
+    void UpdateWaitingJobs(const CounterInstance* counterInstance);
 
-        void unlock()
-        {
-            m_lock.store(false);
-        }
-
-    private:
-        std::atomic<bool> m_lock{ false };
-    };
-
-    // Implementation from WickedEngine blog
+    // Implementation inspired by WickedEngine blog
     template <typename T, size_t capacity>
     class ThreadSafeRingBuffer
     {
@@ -78,125 +56,236 @@ namespace Job
     struct JobInstance
     {
         std::function<void()> m_executable;
-        Counter* m_pCounter{ nullptr };
+        Counter m_counter;
     };
 
-    uint32_t numThreads = 0;
-    ThreadSafeRingBuffer<JobInstance, 256> jobPool;
-
-    SpinLock waitingJobsLock;
-    std::map < Counter*, std::vector<std::pair<JobInstance, uint32_t>>> waitingJobs;
-
-    std::atomic<uint64_t> currentLabel = 0;
-    std::atomic<uint64_t> finishedLabel;
-   
-    inline void poll()
+    class CounterInstance
     {
-        std::this_thread::yield();
-    }
+    private:
+        friend void UpdateWaitingJobs(const CounterInstance* counterInstance);
+        friend void WorkerMainLoop();
+        friend Counter;
 
-    void UpdateWaitingJob(Counter * pCounter)
-    {
-        waitingJobsLock.lock();
-        auto it = waitingJobs.find(pCounter);
-        if (it != waitingJobs.end())
+        uint64_t GetValue() const { return m_counter.load(); }
+
+        void Decrement()
         {
-            std::vector < std::pair<JobInstance, uint32_t>>& jobs{ it->second };
-            auto itJobs = jobs.begin();
-            for (; itJobs != jobs.end(); )
-            {
-                auto& [jobInstance, fenceValue] = *itJobs;
-                if (fenceValue <= pCounter->load())
-                {
-                    while (!jobPool.push_back(jobInstance)) {}
-                    if (itJobs + 1 == jobs.end())
-                    {
-                        jobs.pop_back();
-                        break;
-                    }
+            m_counter.fetch_sub(1);
+            UpdateWaitingJobs(this);
 
-                    *itJobs = jobs.back();
-                    jobs.pop_back();
-                    continue;
-                }
-                ++itJobs;
-            }
-            if (it->second.empty())
+            for (auto& listeningCounter : m_listeningCounters)
             {
-                waitingJobs.erase(it);
+                listeningCounter->Decrement();
             }
         }
-        waitingJobsLock.unlock();
+
+        void Addlistener(const Counter& counter) const
+        {
+            m_listenerLock.lock();
+            m_listeningCounters.push_back(counter.m_pCounterInstance);
+            m_listenerLock.unlock();
+        }
+
+    private:
+        std::atomic<uint64_t> m_counter{ 0 };
+        mutable std::vector<std::shared_ptr<CounterInstance>> m_listeningCounters;
+        mutable SpinLock m_listenerLock;
+    };
+
+    uint32_t g_workerCount{ 0 };
+    std::vector<std::thread> g_workers;
+    ThreadSafeRingBuffer<JobInstance, 256> g_jobPool;
+
+    SpinLock g_waitingJobsLock;
+    std::unordered_map <const CounterInstance*, std::vector<JobInstance>> g_waitingJobs;
+
+    std::atomic<uint64_t>   g_currentLabel{ 0 };
+    std::atomic<uint64_t>   g_finishedLabel{ 0 };
+    bool                    g_workerRunning{ false };
+
+    void UpdateWaitingJobs(const CounterInstance* counterInstance)
+    {
+        if (counterInstance->GetValue() != 0)
+            return;
+
+        g_waitingJobsLock.lock();
+        auto it = g_waitingJobs.find(counterInstance);
+        if (it != g_waitingJobs.end())
+        {
+            for (JobInstance& job : it->second)
+            {
+                while (!g_jobPool.push_back(std::move(job))) {}
+            }
+            g_waitingJobs.erase(it);
+        }
+        g_waitingJobsLock.unlock();
+    }
+
+    void WorkerMainLoop()
+    {
+        JobInstance job;
+
+        while (g_workerRunning)
+        {
+            if (g_jobPool.pop_front(job))
+            {
+                (job.m_executable)();
+
+                Counter& counter = job.m_counter;
+                counter--;
+                UpdateWaitingJobs(counter.GetPtrValue());
+
+                for (auto& listeningCounter : counter.GetPtrValue()->m_listeningCounters)
+                {
+                    UpdateWaitingJobs(listeningCounter.get());
+                }
+
+                g_finishedLabel.fetch_add(1);
+            }
+            else
+            {
+                std::this_thread::yield();
+            }
+        }
     }
 
     void Initialize()
     {
-        finishedLabel.store(0);
+        g_workerRunning = true;
 
-        unsigned int numCores = std::thread::hardware_concurrency();
+        unsigned int numCores{ std::thread::hardware_concurrency() };
 
-        numThreads = (numCores == 0u) ? 1u : numCores;
+        g_workerCount = (numCores == 0u) ? 1u : numCores;
+        g_workers.reserve(g_workerCount);
 
-        for (uint32_t threadID = 0; threadID < numThreads; ++threadID)
+        for (uint32_t threadID = 0; threadID < g_workerCount; ++threadID)
         {
-            std::thread worker([] {
-
-                JobInstance job;
-
-                while (true)
-                {
-                    if (jobPool.pop_front(job))
-                    {
-                        (job.m_executable)();
-                        (*job.m_pCounter).fetch_add(1);
-                        
-                        UpdateWaitingJob(job.m_pCounter);
-
-                        finishedLabel.fetch_add(1);
-                    }
-                    else
-                    {
-                        poll();
-                    }
-                }
-
-                });
-
-            worker.detach();
+            g_workers.emplace_back(&WorkerMainLoop);
         }
     }
 
-    bool IsBusy()
+    void Shutdown()
     {
-        return finishedLabel.load() < currentLabel.load();
+        g_workerRunning = false;
+
+        for (std::thread& worker : g_workers)
+        {
+            if (worker.joinable())
+                worker.join();
+        }
     }
 
     void Wait()
     {
-        while (IsBusy()) { poll(); }
+        while (g_finishedLabel.load() < g_currentLabel.load()) { std::this_thread::yield(); }
+    }
+
+    void WaitForCounter(const Counter& counter)
+    {
+        while (counter.GetValue() != 0) { std::this_thread::yield(); }
+    }
+
+    void SpinLock::lock()
+    {
+        while (g_workerRunning)
+        {
+            while (m_lock)
+            {
+                _mm_pause();
+            }
+
+            if (!m_lock.exchange(true))
+                break;
+        }
+    }
+
+    void SpinLock::unlock()
+    {
+        m_lock.store(false);
+    }
+
+    Counter::Counter()
+    {
+        m_pCounterInstance = std::shared_ptr<CounterInstance>{ new CounterInstance() };
+    }
+
+    Counter& Counter::operator++()
+    {
+        m_pCounterInstance->m_counter.fetch_add(1);
+        return *this;
+    }
+
+    Counter& Counter::operator++(int)
+    {
+        return ++(*this);
+    }
+
+    Counter& Counter::operator--()
+    {
+        m_pCounterInstance->Decrement();
+        return *this;
+    }
+
+    Counter& Counter::operator--(int)
+    {
+        return --(*this);
+    }
+
+    Counter& Counter::operator+=(const Counter& other)
+    {
+        other.m_pCounterInstance->Addlistener(*this);
+        m_pCounterInstance->m_counter.fetch_add(other.GetValue());
+        return *this;
+    }
+
+    uint64_t Counter::GetValue() const 
+    { 
+        return m_pCounterInstance->GetValue(); 
+    }
+
+    CounterInstance* Counter::GetPtrValue() const 
+    { 
+        return m_pCounterInstance.get(); 
     }
 
     JobBuilder::JobBuilder()
-    {}
+    {
+        m_counter = Counter();
+    }
 
     void JobBuilder::DispatchExplicitFence()
     {
-        m_fence.store(m_totalJob);
+        if (m_counter.GetValue() > 0)
+        {
+            m_fence = std::move(m_counter);
+            m_counter = Counter();
+        }
+    }
+
+    void JobBuilder::DispatchWait(const Counter& counter)
+    {
+        m_fence += counter;
+    }
+
+    const Counter& JobBuilder::ExtractWaitCounter()
+    {
+        return (m_counter.GetValue() == 0) ? m_fence : m_counter;
     }
 
     void JobBuilder::DispatchJobInternal(const std::function<void()>& job)
     {
-        currentLabel.fetch_add(1);
+        m_counter++;
+        g_currentLabel.fetch_add(1);
 
-        if (m_fence > m_jobFinished)
+        if ((m_fence.GetValue()) > 0)
         {
-            waitingJobsLock.lock();
-            waitingJobs[&m_jobFinished].emplace_back(JobInstance{ job, &m_jobFinished }, m_fence.load());
-            waitingJobsLock.unlock();
+            g_waitingJobsLock.lock();
+            g_waitingJobs[m_fence.GetPtrValue()].emplace_back(JobInstance{job, m_counter});
+            g_waitingJobsLock.unlock();
         }
         else
         {
-            while (!jobPool.push_back(JobInstance{ job, &m_jobFinished })) { poll(); }
+            while (!g_jobPool.push_back(JobInstance{ job, m_counter})) { std::this_thread::yield(); }
         }
     }
 }
