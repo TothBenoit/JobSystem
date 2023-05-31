@@ -1,5 +1,6 @@
 #include "JobSystem.h"
 
+#include <windows.h>
 #include <thread>   
 #include <emmintrin.h>
 #include <unordered_map>
@@ -63,7 +64,7 @@ namespace Job
     {
     private:
         friend void UpdateWaitingJobs(const CounterInstance* counterInstance);
-        friend void WorkerMainLoop();
+        friend void WorkerMainLoop(void * pData);
         friend Counter;
 
         uint64_t GetValue() const { return m_counter.load(); }
@@ -96,6 +97,11 @@ namespace Job
     std::vector<std::thread> g_workers;
     ThreadSafeRingBuffer<JobInstance, 256> g_jobPool;
 
+    const uint32_t g_fiberPerThread{ 64 };
+    thread_local std::vector<void*> g_fibers;
+    thread_local void* g_pMainFiber{ nullptr };
+    thread_local void* g_pCurrentFiber { nullptr };
+
     SpinLock g_waitingJobsLock;
     std::unordered_map <const CounterInstance*, std::vector<JobInstance>> g_waitingJobs;
 
@@ -121,7 +127,7 @@ namespace Job
         g_waitingJobsLock.unlock();
     }
 
-    void WorkerMainLoop()
+    void WorkerMainLoop(void* pData)
     {
         JobInstance job;
 
@@ -147,6 +153,18 @@ namespace Job
                 std::this_thread::yield();
             }
         }
+        ::SwitchToFiber(g_pMainFiber);
+    }
+
+    void InitThread()
+    {
+        g_pMainFiber = ::ConvertThreadToFiber(nullptr);
+        g_fibers.reserve(g_fiberPerThread);
+        for (uint32_t i = 0; i < g_fiberPerThread; i++)
+            g_fibers.push_back(::CreateFiber(64 * 1024, &WorkerMainLoop, nullptr));
+        g_pCurrentFiber = g_fibers.back();
+        g_fibers.pop_back();
+        ::SwitchToFiber(g_pCurrentFiber);
     }
 
     void Initialize()
@@ -160,7 +178,7 @@ namespace Job
 
         for (uint32_t threadID = 0; threadID < g_workerCount; ++threadID)
         {
-            g_workers.emplace_back(&WorkerMainLoop);
+            g_workers.emplace_back(&InitThread);
         }
     }
 

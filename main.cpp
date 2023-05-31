@@ -11,6 +11,12 @@ void Test()
 		jobBuilder1.DispatchJob([=]()
 			{
 				std::cout << "1) Job " << i << "\n";
+				Job::JobBuilder jobBuilder;
+				jobBuilder.DispatchJob([=]()
+					{
+						std::cout << "\t1) Intermediate job " << i << "\n";
+					});
+				Job::WaitForCounter(jobBuilder.ExtractWaitCounter());
 			}
 		);
 	}

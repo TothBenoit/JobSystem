@@ -46,7 +46,7 @@ namespace Job
         CounterInstance* GetPtrValue() const;
 
     private:
-        friend void WorkerMainLoop();
+        friend void WorkerMainLoop(void* pData);
         friend class JobBuilder;
         friend CounterInstance;
 
