@@ -74,22 +74,22 @@ namespace Job
             m_counter.fetch_sub(1);
             UpdateWaitingJobs(this);
 
-            for (auto& listeningCounter : m_listeningCounters)
+            for (auto& waitingCounter : m_waitingCounters)
             {
-                listeningCounter->Decrement();
+                waitingCounter->Decrement();
             }
         }
 
-        void Addlistener(const Counter& counter) const
+        void Addlistener(Counter& counter) const
         {
             m_listenerLock.lock();
-            m_listeningCounters.push_back(counter.m_pCounterInstance);
+            m_waitingCounters.push_back(counter.m_pCounterInstance);
             m_listenerLock.unlock();
         }
 
     private:
         std::atomic<uint64_t> m_counter{ 0 };
-        mutable std::vector<std::shared_ptr<CounterInstance>> m_listeningCounters;
+        mutable std::vector<std::shared_ptr<CounterInstance>> m_waitingCounters;
         mutable SpinLock m_listenerLock;
     };
 
@@ -141,9 +141,9 @@ namespace Job
                 counter--;
                 UpdateWaitingJobs(counter.GetPtrValue());
 
-                for (auto& listeningCounter : counter.GetPtrValue()->m_listeningCounters)
+                for (auto& waitingCounter : counter.GetPtrValue()->m_waitingCounters)
                 {
-                    UpdateWaitingJobs(listeningCounter.get());
+                    UpdateWaitingJobs(waitingCounter.get());
                 }
 
                 g_finishedLabel.fetch_add(1);
