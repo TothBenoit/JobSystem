@@ -1,65 +1,78 @@
 #include "JobSystem.h"
 #include <iostream>
-
+#include <sstream>
 
 void Test()
 {
 	Job::JobBuilder jobBuilder1;
 
-	for (int i = 0; i < 10; i++)
-	{
-		jobBuilder1.DispatchJob([=]()
+	jobBuilder1.DispatchJob([]()
+		{
+			std::cout << "1) Job " << "\n";
+			Job::JobBuilder jobBuilder;
+			for (int i = 0; i < 10; i++)
 			{
-				std::cout << "1) Job " << i << "\n";
-				Job::JobBuilder jobBuilder;
 				jobBuilder.DispatchJob([=]()
 					{
-						std::cout << "\t1) Intermediate job " << i << "\n";
+						std::stringstream sstream;
+						sstream << "\tIntermediate job " << i << "\n";
+						std::cout << sstream.str();
 					});
-				Job::WaitForCounter(jobBuilder.ExtractWaitCounter());
 			}
-		);
-	}
-	jobBuilder1.DispatchJob([]()
-		{ 
-			std::cout << "\n----------------\nFirst batch of job done\n----------------\n\n"; 
+			Job::WaitForCounter(jobBuilder.ExtractWaitCounter());
+			std::cout << "\n----------------\nFirst batch of job done\n----------------\n\n";
 		}
 	);
 
 	Job::Counter counter{ jobBuilder1.ExtractWaitCounter() };
-	
 	{
 		Job::JobBuilder jobBuilder2;
 		jobBuilder2.DispatchWait(counter);
-		for (int i = 10; i < 20; i++)
-		{
-			jobBuilder2.DispatchJob<Job::Fence::None>([=]()
+		jobBuilder2.DispatchJob<Job::Fence::None>([]()
+			{
+				std::cout << "2) Job " << "\n";
+				Job::JobBuilder jobBuilder;
+				for (int i = 0; i < 10; i++)
 				{
-					std::cout << "2) Job " << i << "\n";
+					jobBuilder.DispatchJob<Job::Fence::None>([=]()
+						{
+							std::stringstream sstream;
+							sstream << "\tIntermediate job " << i << "\n";
+							std::cout << sstream.str();
+						});
 				}
-			);
-		}
-		jobBuilder2.DispatchExplicitFence();
-		jobBuilder2.DispatchJob([]()
-			{
-				std::cout << "\n----------------\nSecond batch of job done\n----------------\n\n";
-			}
-		);
-		counter = jobBuilder2.ExtractWaitCounter();
-	}
-
-	jobBuilder1.DispatchWait(counter);
-	for (int i = 20; i < 30; i++)
-	{
-		jobBuilder1.DispatchJob([=]()
-			{
-				std::cout << "3) Job " << i << "\n";
+				jobBuilder.DispatchExplicitFence();
+				jobBuilder.DispatchJob([]()
+					{
+						std::cout << "\n----------------\nSecond batch of job done\n----------------\n\n";
+					}
+				);
 			}
 		);
 	}
 
 	Job::Wait();
-	std::cout << "\n----------------\nLast batch of job done\n----------------\n";
+	jobBuilder1.DispatchJob([]()
+		{
+			std::cout << "3) Job " << "\n";
+			Job::JobBuilder jobBuilder;
+			for (int i = 0; i < 10; i++)
+			{
+				jobBuilder.DispatchJob([=]()
+					{
+						std::stringstream sstream;
+						sstream << "\tIntermediate job " << i << "\n";
+						std::cout << sstream.str();
+					});
+			}
+			Job::WaitForCounter(jobBuilder.ExtractWaitCounter());
+		}
+	);
+	jobBuilder1.DispatchJob([]()
+		{
+			std::cout << "\n----------------\nLast batch of job done\n----------------\n\n";
+		}
+	);
 }
 
 int main()
@@ -68,5 +81,6 @@ int main()
 	
 	Test();
 
+	Job::Wait();
 	Job::Shutdown();
 }

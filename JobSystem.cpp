@@ -4,6 +4,7 @@
 #include <thread>   
 #include <emmintrin.h>
 #include <unordered_map>
+#include <assert.h>
 
 namespace Job
 {
@@ -11,19 +12,20 @@ namespace Job
 
     void WorkerMainLoop();
     void UpdateWaitingJobs(const CounterInstance* counterInstance);
+    void WaitForCounter_Fiber(const Counter& counter);
+    void InitThread(uint32_t threadID);
 
     // Implementation inspired by WickedEngine blog
     template <typename T, size_t capacity>
     class ThreadSafeRingBuffer
     {
     public:
-
         inline bool push_back(const T& item)
         {
             bool result = false;
             lock.lock();
-            size_t next = (head + 1) % capacity;
-            if (next != tail)
+            size_t next = (head + 1) % (capacity+1);
+            if(next != tail)
             {
                 data[head] = item;
                 head = next;
@@ -40,7 +42,7 @@ namespace Job
             if (tail != head)
             {
                 item = data[tail];
-                tail = (tail + 1) % capacity;
+                tail = (tail + 1) % (capacity+1);
                 result = true;
             }
             lock.unlock();
@@ -48,7 +50,7 @@ namespace Job
         }
 
     private:
-        T data[capacity];
+        T data[capacity+1];
         size_t head = 0;
         size_t tail = 0;
         SpinLock lock;
@@ -58,6 +60,7 @@ namespace Job
     {
         std::function<void()> m_executable;
         Counter m_counter;
+        Counter m_fence;
     };
 
     class CounterInstance
@@ -82,49 +85,101 @@ namespace Job
 
         void Addlistener(Counter& counter) const
         {
-            m_listenerLock.lock();
-            m_waitingCounters.push_back(counter.m_pCounterInstance);
-            m_listenerLock.unlock();
+            m_waitingCountersLock.lock();
+            m_waitingCounters.push_back(counter.GetPtrValue());
+            m_waitingCountersLock.unlock();
         }
 
     private:
         std::atomic<uint64_t> m_counter{ 0 };
-        mutable std::vector<std::shared_ptr<CounterInstance>> m_waitingCounters;
-        mutable SpinLock m_listenerLock;
+        mutable std::vector<CounterInstance*> m_waitingCounters;
+        mutable SpinLock m_waitingCountersLock;
     };
 
+	struct FiberDecl
+	{
+		void* pFiber;
+		uint32_t threadIndex;
+	};
+
+    const uint32_t g_fiberPerThread{ 32 };
+    struct Worker
+    {
+        Worker(void (*pFunc)(uint32_t))
+            : pEntryPoint{ pFunc }
+        {}
+        
+        void Run(uint32_t threadID)
+        {
+            thread = std::thread(pEntryPoint, threadID);
+        }
+
+        void (*pEntryPoint)(uint32_t);
+        std::thread thread;
+        ThreadSafeRingBuffer<FiberDecl, g_fiberPerThread> freeFibers;
+        ThreadSafeRingBuffer<FiberDecl, g_fiberPerThread> sleepingFibers;
+    };
+    
     uint32_t g_workerCount{ 0 };
-    std::vector<std::thread> g_workers;
+    std::vector<Worker*> g_pWorkers;
     ThreadSafeRingBuffer<JobInstance, 256> g_jobPool;
 
-    const uint32_t g_fiberPerThread{ 64 };
-    thread_local std::vector<void*> g_fibers;
-    thread_local void* g_pMainFiber{ nullptr };
-    thread_local void* g_pCurrentFiber { nullptr };
+    SpinLock g_waitingFibersLock;
+    std::unordered_map <const CounterInstance*, std::vector<FiberDecl>> g_waitingFibers;
 
-    SpinLock g_waitingJobsLock;
-    std::unordered_map <const CounterInstance*, std::vector<JobInstance>> g_waitingJobs;
+#pragma optimize( "", off )
+    thread_local uint32_t g_threadIndex;
+	thread_local void* g_pMainFiber{ nullptr };
+	thread_local FiberDecl g_pCurrentFiber{ nullptr, 0 };
+#pragma optimize( "", on )
 
     std::atomic<uint64_t>   g_currentLabel{ 0 };
     std::atomic<uint64_t>   g_finishedLabel{ 0 };
     bool                    g_workerRunning{ false };
+
+	void Switch_Fiber()
+	{
+		bool result = g_pWorkers[g_threadIndex]->freeFibers.push_back(g_pCurrentFiber);
+
+		assert(result);
+		if (!g_pWorkers[g_threadIndex]->sleepingFibers.pop_front(g_pCurrentFiber))
+		{
+			result = g_pWorkers[g_threadIndex]->freeFibers.pop_front(g_pCurrentFiber);
+			assert(result);
+		}
+		assert(g_pCurrentFiber.pFiber);
+
+		::SwitchToFiber(g_pCurrentFiber.pFiber);
+	}
+
+	void Switch()
+	{
+		if (g_pCurrentFiber.pFiber)
+		{
+			Switch_Fiber();
+		}
+		else
+		{
+			std::this_thread::yield();
+		}
+	}
 
     void UpdateWaitingJobs(const CounterInstance* counterInstance)
     {
         if (counterInstance->GetValue() != 0)
             return;
 
-        g_waitingJobsLock.lock();
-        auto it = g_waitingJobs.find(counterInstance);
-        if (it != g_waitingJobs.end())
+        g_waitingFibersLock.lock();
+        auto it = g_waitingFibers.find(counterInstance);
+        if (it != g_waitingFibers.end())
         {
-            for (JobInstance& job : it->second)
+            for (FiberDecl& fiber : it->second)
             {
-                while (!g_jobPool.push_back(std::move(job))) {}
+                while (!g_pWorkers[fiber.threadIndex]->sleepingFibers.push_back(fiber)) { Switch_Fiber(); }
             }
-            g_waitingJobs.erase(it);
+            g_waitingFibers.erase(it);
         }
-        g_waitingJobsLock.unlock();
+        g_waitingFibersLock.unlock();
     }
 
     void WorkerMainLoop(void* pData)
@@ -135,36 +190,41 @@ namespace Job
         {
             if (g_jobPool.pop_front(job))
             {
+                if (job.m_fence.GetValue() > 0)
+                {
+                    WaitForCounter_Fiber(job.m_fence);
+                }
+
                 (job.m_executable)();
 
                 Counter& counter = job.m_counter;
                 counter--;
-                UpdateWaitingJobs(counter.GetPtrValue());
-
-                for (auto& waitingCounter : counter.GetPtrValue()->m_waitingCounters)
-                {
-                    UpdateWaitingJobs(waitingCounter.get());
-                }
 
                 g_finishedLabel.fetch_add(1);
             }
-            else
-            {
-                std::this_thread::yield();
-            }
-        }
+
+            Switch_Fiber();
+		}
         ::SwitchToFiber(g_pMainFiber);
     }
 
-    void InitThread()
+    void InitThread(uint32_t threadID)
     {
+        assert(!g_pMainFiber);
         g_pMainFiber = ::ConvertThreadToFiber(nullptr);
-        g_fibers.reserve(g_fiberPerThread);
+        g_threadIndex = threadID;
+
         for (uint32_t i = 0; i < g_fiberPerThread; i++)
-            g_fibers.push_back(::CreateFiber(64 * 1024, &WorkerMainLoop, nullptr));
-        g_pCurrentFiber = g_fibers.back();
-        g_fibers.pop_back();
-        ::SwitchToFiber(g_pCurrentFiber);
+        {
+            FiberDecl decl{ ::CreateFiber(64 * 1024, &WorkerMainLoop, nullptr), g_threadIndex };
+            bool result = g_pWorkers[g_threadIndex]->freeFibers.push_back(decl);
+            assert(result);
+        }
+
+        bool result = g_pWorkers[g_threadIndex]->freeFibers.pop_front(g_pCurrentFiber);
+        assert(result);
+
+        ::SwitchToFiber(g_pCurrentFiber.pFiber);
     }
 
     void Initialize()
@@ -173,12 +233,12 @@ namespace Job
 
         unsigned int numCores{ std::thread::hardware_concurrency() };
 
-        g_workerCount = (numCores == 0u) ? 1u : numCores;
-        g_workers.reserve(g_workerCount);
-
+        g_workerCount = (numCores == 0u) ? 1u : ((numCores > 8u) ? 8u : numCores);
+        g_pWorkers.reserve(g_workerCount);
         for (uint32_t threadID = 0; threadID < g_workerCount; ++threadID)
         {
-            g_workers.emplace_back(&InitThread);
+            g_pWorkers.push_back(new Worker(&InitThread));
+            g_pWorkers.back()->Run(threadID);
         }
     }
 
@@ -186,21 +246,42 @@ namespace Job
     {
         g_workerRunning = false;
 
-        for (std::thread& worker : g_workers)
+        for (Worker* pWorker : g_pWorkers)
         {
-            if (worker.joinable())
-                worker.join();
+            if (pWorker->thread.joinable())
+                pWorker->thread.join();
         }
     }
 
     void Wait()
     {
+        assert(!g_pCurrentFiber.pFiber); // Can't wait for all jobs to finish within a job
         while (g_finishedLabel.load() < g_currentLabel.load()) { std::this_thread::yield(); }
     }
 
     void WaitForCounter(const Counter& counter)
     {
-        while (counter.GetValue() != 0) { std::this_thread::yield(); }
+        if (g_pCurrentFiber.pFiber)
+        {
+            WaitForCounter_Fiber(counter);
+        }
+        else
+        {
+            while (counter.GetValue() != 0) { std::this_thread::yield(); }
+        }
+    }
+
+    void WaitForCounter_Fiber(const Counter& counter)
+    {
+		g_waitingFibersLock.lock();
+		g_waitingFibers[counter.GetPtrValue()].push_back(g_pCurrentFiber);
+		g_waitingFibersLock.unlock();
+
+        if (!g_pWorkers[g_threadIndex]->sleepingFibers.pop_front(g_pCurrentFiber))
+		    while (!g_pWorkers[g_threadIndex]->freeFibers.pop_front(g_pCurrentFiber)) { Switch_Fiber(); }
+		assert(g_pCurrentFiber.pFiber);
+
+		::SwitchToFiber(g_pCurrentFiber.pFiber);
     }
 
     void SpinLock::lock()
@@ -287,7 +368,8 @@ namespace Job
 
     const Counter& JobBuilder::ExtractWaitCounter()
     {
-        return (m_counter.GetValue() == 0) ? m_fence : m_counter;
+        DispatchExplicitFence();
+        return m_fence;
     }
 
     void JobBuilder::DispatchJobInternal(const std::function<void()>& job)
@@ -295,15 +377,6 @@ namespace Job
         m_counter++;
         g_currentLabel.fetch_add(1);
 
-        if ((m_fence.GetValue()) > 0)
-        {
-            g_waitingJobsLock.lock();
-            g_waitingJobs[m_fence.GetPtrValue()].emplace_back(JobInstance{job, m_counter});
-            g_waitingJobsLock.unlock();
-        }
-        else
-        {
-            while (!g_jobPool.push_back(JobInstance{ job, m_counter})) { std::this_thread::yield(); }
-        }
+        while (!g_jobPool.push_back(JobInstance{ job, m_counter, m_fence })) { Switch(); }
     }
 }

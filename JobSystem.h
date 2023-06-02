@@ -3,6 +3,8 @@
 #include <memory>
 #include <functional>
 
+#pragma warning( disable : 4530)
+
 /*************************/
 // TODO :
 // - Use fibers
@@ -46,8 +48,7 @@ namespace Job
         CounterInstance* GetPtrValue() const;
 
     private:
-        friend void WorkerMainLoop(void* pData);
-        friend class JobBuilder;
+        friend void WaitForCounter_Fiber(const Counter&);
         friend CounterInstance;
 
         std::shared_ptr<CounterInstance> m_pCounterInstance;
