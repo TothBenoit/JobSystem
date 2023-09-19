@@ -184,28 +184,38 @@ namespace Job
 
     void WorkerMainLoop(void* pData)
     {
-        JobInstance job;
-
-        while (g_workerRunning)
         {
-            if (g_jobPool.pop_front(job))
+            JobInstance job;
+
+            while (g_workerRunning)
             {
-                if (job.m_fence.GetValue() > 0)
+                if (g_jobPool.pop_front(job))
                 {
-                    WaitForCounter_Fiber(job.m_fence);
+                    if (job.m_fence.GetValue() > 0)
+                    {
+                        WaitForCounter_Fiber(job.m_fence);
+                    }
+
+                    (job.m_executable)();
+
+                    Counter& counter = job.m_counter;
+                    counter--;
+
+                    g_finishedLabel.fetch_add(1);
                 }
 
-                (job.m_executable)();
-
-                Counter& counter = job.m_counter;
-                counter--;
-
-                g_finishedLabel.fetch_add(1);
+                Switch_Fiber();
             }
+        }
 
-            Switch_Fiber();
-		}
-        ::SwitchToFiber(g_pMainFiber);
+        // Shutdown in progress
+        // Every job must exit the previous scope to destroy the jobInstance
+
+        if (!g_pWorkers[g_threadIndex]->sleepingFibers.pop_front(g_pCurrentFiber))
+            if (!g_pWorkers[g_threadIndex]->freeFibers.pop_front(g_pCurrentFiber))
+                g_pCurrentFiber.pFiber = g_pMainFiber;
+
+        ::SwitchToFiber(g_pCurrentFiber.pFiber);
     }
 
     void InitThread(uint32_t threadID)
@@ -250,6 +260,13 @@ namespace Job
         {
             if (pWorker->thread.joinable())
                 pWorker->thread.join();
+        }
+
+        while (!g_pWorkers.empty())
+        {
+            Worker* pWorker{ g_pWorkers.back() };
+            g_pWorkers.pop_back();
+            delete(pWorker);
         }
     }
 
