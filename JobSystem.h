@@ -1,13 +1,11 @@
 #pragma once
 #include <atomic>
-#include <memory>
 #include <functional>
 
 #pragma warning( disable : 4530)
 
 /*************************/
 // TODO :
-// - Use fibers
 // - Add different priority queues
 /*************************/
 
@@ -21,20 +19,16 @@ namespace Job
     void Wait();
     void WaitForCounter(const Counter& counter);
 
-    class SpinLock
-    {
-    public:
-        void lock();
-        void unlock();
-
-    private:
-        std::atomic<bool> m_lock{ false };
-    };
 
     class Counter
     {
     public:
         Counter();
+        Counter(const Counter&);
+        Counter& operator=(const Counter&);
+        Counter(Counter&&);
+        Counter& operator=(Counter&&);
+        ~Counter();
 
         Counter& operator++();
         Counter& operator++(int);
@@ -42,16 +36,13 @@ namespace Job
         Counter& operator--(int);
         Counter& operator+=(const Counter& other);
 
-        uint64_t GetValue() const;
-
-    private:
-        CounterInstance* GetPtrValue() const;
+        uint32_t GetValue() const;
 
     private:
         friend void WaitForCounter_Fiber(const Counter&);
         friend CounterInstance;
 
-        std::shared_ptr<CounterInstance> m_pCounterInstance;
+        CounterInstance* m_pCounterInstance;
     };
 
     enum class Fence
@@ -63,8 +54,6 @@ namespace Job
     class JobBuilder
     {
     public:
-        JobBuilder();
-
         template<Fence fenceType = Fence::With>
         void DispatchJob(const std::function<void()>& job);
         void DispatchExplicitFence();
