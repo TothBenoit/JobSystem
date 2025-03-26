@@ -131,7 +131,6 @@ namespace Job
         ThreadSafeRingBuffer<FiberDecl, g_fiberPerThread> sleepingFibers;
     };
     
-    uint32_t g_workerCount{ 0 };
     std::vector<Worker*> g_pWorkers;
     ThreadSafeRingBuffer<JobInstance, 256> g_jobPool;
 
@@ -254,9 +253,9 @@ namespace Job
 
         uint32_t numCores{ std::thread::hardware_concurrency() };
 
-        g_workerCount = (numCores == 0u) ? 1u : ((numCores > 8u) ? 8u : numCores);
-        g_pWorkers.reserve(g_workerCount);
-        for (uint32_t threadID = 0; threadID < g_workerCount; ++threadID)
+        uint32_t workerCount = (numCores == 0u) ? 1u : ((numCores > 8u) ? 8u : numCores);
+        g_pWorkers.reserve(workerCount);
+        for (uint32_t threadID = 0; threadID < workerCount; ++threadID)
         {
             g_pWorkers.push_back(new Worker(&InitThread));
             g_pWorkers.back()->Run(threadID);
