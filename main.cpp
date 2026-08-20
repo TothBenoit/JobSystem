@@ -27,6 +27,9 @@ void Test()
 	Job::Counter counter{ jobBuilder1.ExtractWaitCounter() };
 	{
 		Job::JobBuilder jobBuilder2;
+		jobBuilder2.DispatchJob<Job::Fence::None>([]() {
+			std::cout << "Before wait" << "\n";
+		});
 		jobBuilder2.DispatchWait(counter);
 		jobBuilder2.DispatchJob<Job::Fence::None>([]()
 			{
