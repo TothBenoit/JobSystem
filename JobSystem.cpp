@@ -82,18 +82,30 @@ namespace Job
 
 		void Decrement()
 		{
-			if (m_counter.fetch_sub(1) == 1)
+			m_waitingCountersLock.lock();
+			bool hasFinished = m_counter.fetch_sub(1) == 1;
+			bool hasWaitingJobs = m_hasWaitingJobs;
+			WaitingListEntry* pCurrentWaitingCounter = m_pWaitingCounters;
+			m_waitingCountersLock.unlock();
+			if (hasFinished) 
 			{
-				if (m_hasWaitingJobs)
+				if (hasWaitingJobs)
 					UpdateWaitingJobs(this);
-				m_waitingCountersLock.lock();
-				WaitingListEntry* pCurrentWaitingCounter = m_pWaitingCounters;
-				m_waitingCountersLock.unlock();
 				while (pCurrentWaitingCounter) {
 					pCurrentWaitingCounter->m_pCounter->Decrement();
 					pCurrentWaitingCounter = pCurrentWaitingCounter->m_pNext;
 				}
 			}
+		}
+
+		bool RegisterWaitingJobs() const
+		{
+			m_waitingCountersLock.lock();
+			bool hasFinished = GetValue() == 0;
+			if (!hasFinished)
+				m_hasWaitingJobs = true;
+			m_waitingCountersLock.unlock();
+			return hasFinished;
 		}
 
 		void AddListener(CounterInstance& counter) const
@@ -227,7 +239,9 @@ namespace Job
 
 	void WaitForCounter_Fiber(const CounterInstance* pCounter)
 	{
-		pCounter->m_hasWaitingJobs = true;
+		bool hasFinished = pCounter->RegisterWaitingJobs();
+		if (hasFinished)
+			return;
 		g_waitingFibersLock.lock();
 		g_waitingFibers[pCounter].push_back(g_pCurrentFiber);
 		g_waitingFibersLock.unlock();
@@ -249,7 +263,7 @@ namespace Job
 				if (g_jobPool.pop_front(job))
 				{
 					CounterInstance* pFence = job.m_pFence;
-					if (pFence->GetValue() > 0)
+					if (pFence && pFence->GetValue() > 0)
 					{
 						WaitForCounter_Fiber(pFence);
 					}
@@ -260,7 +274,7 @@ namespace Job
 					pCounter->Decrement();
 					if (pCounter->m_refCount.fetch_sub(1) == 1)
 						delete job.m_pCounter;
-					if (pFence->m_refCount.fetch_sub(1) == 1)
+					if (pFence && pFence->m_refCount.fetch_sub(1) == 1)
 						delete pFence;
 
 					g_finishedLabel.fetch_add(1);
@@ -342,7 +356,8 @@ namespace Job
 	{
 		if (g_pCurrentFiber.pFiber)
 		{
-			WaitForCounter_Fiber(counter.m_pCounterInstance);
+			if (counter.m_pCounterInstance && counter.m_pCounterInstance->GetValue() > 0)
+				WaitForCounter_Fiber(counter.m_pCounterInstance);
 		}
 		else
 		{
@@ -371,55 +386,63 @@ namespace Job
 
 	Counter::Counter()
 	{
-		m_pCounterInstance = new CounterInstance();
 	}
 
 	Counter::Counter(const Counter& other)
 	{
-		if (&other == this)
-			return;
-		m_pCounterInstance = new CounterInstance();
-		other.m_pCounterInstance->AddListener(*m_pCounterInstance);
+		if (other.m_pCounterInstance)
+		{
+			m_pCounterInstance = new CounterInstance();
+			other.m_pCounterInstance->AddListener(*m_pCounterInstance);
+		}
 	}
 
 	Counter& Counter::operator=(const Counter& other)
 	{
-		if (&other == this)
+		if (other.m_pCounterInstance == m_pCounterInstance)
 			return *this;
-		if (m_pCounterInstance->m_refCount.fetch_sub(1) == 1)
-			delete m_pCounterInstance;
-		m_pCounterInstance = new CounterInstance();
-		other.m_pCounterInstance->AddListener(*m_pCounterInstance);
+		Reset();
+		if (other.m_pCounterInstance)
+		{
+			m_pCounterInstance = new CounterInstance();
+			other.m_pCounterInstance->AddListener(*m_pCounterInstance);
+		}
 		return *this;
 	}
 
 	Counter::Counter(Counter&& other)
 	{
-		if (&other == this)
-			return;
-		m_pCounterInstance = other.m_pCounterInstance;
-		m_pCounterInstance->m_refCount.fetch_add(1);
+		if (other.m_pCounterInstance)
+		{
+			m_pCounterInstance = other.m_pCounterInstance;
+			m_pCounterInstance->m_refCount.fetch_add(1);
+			other.Reset();
+		}
 	}
 
 	Counter& Counter::operator=(Counter&& other)
 	{
-		if (&other == this)
+		if (other.m_pCounterInstance == m_pCounterInstance)
 			return *this;
-		if (m_pCounterInstance->m_refCount.fetch_sub(1) == 1)
-			delete m_pCounterInstance;
-		m_pCounterInstance = other.m_pCounterInstance;
-		m_pCounterInstance->m_refCount.fetch_add(1);
+		Reset();
+		if (other.m_pCounterInstance)
+		{
+			m_pCounterInstance = other.m_pCounterInstance;
+			m_pCounterInstance->m_refCount.fetch_add(1);
+			other.Reset();
+		}
 		return *this;
 	}
 
 	Counter::~Counter()
 	{
-		if (m_pCounterInstance->m_refCount.fetch_sub(1) == 1)
-			delete m_pCounterInstance;
+		Reset();
 	}
 
 	Counter& Counter::operator++()
 	{
+		if (!m_pCounterInstance)
+			m_pCounterInstance = new CounterInstance();
 		m_pCounterInstance->m_counter.fetch_add(1);
 		return *this;
 	}
@@ -431,6 +454,7 @@ namespace Job
 
 	Counter& Counter::operator--()
 	{
+		assert(m_pCounterInstance);
 		m_pCounterInstance->Decrement();
 		return *this;
 	}
@@ -442,27 +466,39 @@ namespace Job
 
 	Counter& Counter::operator+=(const Counter& other)
 	{
-		if (&other == this)
+		if (other.m_pCounterInstance == m_pCounterInstance)
 			return *this;
 		CounterInstance* pNewInstance = new CounterInstance();
-		m_pCounterInstance->AddListener(*pNewInstance);
-		other.m_pCounterInstance->AddListener(*pNewInstance);
-		if (m_pCounterInstance->m_refCount.fetch_sub(1) == 1)
-			delete m_pCounterInstance;
+		if (m_pCounterInstance)
+		{
+			m_pCounterInstance->AddListener(*pNewInstance);
+			if (m_pCounterInstance->m_refCount.fetch_sub(1) == 1)
+				delete m_pCounterInstance;
+		}
+		if (other.m_pCounterInstance)
+			other.m_pCounterInstance->AddListener(*pNewInstance);
 		m_pCounterInstance = pNewInstance;
 		return *this;
 	}
 
 	Counter Counter::operator+(const Counter& other)
 	{
-		Counter counter{ *this };
-		counter += other;
+		Counter counter{ other };
+		if (m_pCounterInstance)
+			counter += *this;
 		return counter;
 	}
 
 	uint32_t Counter::GetValue() const
 	{ 
-		return m_pCounterInstance->GetValue(); 
+		return m_pCounterInstance ? m_pCounterInstance->GetValue() : 0;
+	}
+
+	void Counter::Reset()
+	{
+		if (m_pCounterInstance && m_pCounterInstance->m_refCount.fetch_sub(1) == 1)
+			delete m_pCounterInstance;
+		m_pCounterInstance = nullptr;
 	}
 
 	void JobBuilder::DispatchExplicitFence()
@@ -489,8 +525,9 @@ namespace Job
 	{
 		m_accumulateCounter++;
 		g_currentLabel.fetch_add(1);
-		m_waitCounter.m_pCounterInstance->m_refCount.fetch_add(1);
+		if ( m_waitCounter.m_pCounterInstance )
+			m_waitCounter.m_pCounterInstance->m_refCount.fetch_add(1);
 		m_accumulateCounter.m_pCounterInstance->m_refCount.fetch_add(1);
-		while (!g_jobPool.push_back(JobInstance{ job,  m_waitCounter.m_pCounterInstance, m_accumulateCounter.m_pCounterInstance })) { Switch(); }
+		while (!g_jobPool.push_back(JobInstance{ job, m_waitCounter.m_pCounterInstance, m_accumulateCounter.m_pCounterInstance })) { Switch(); }
 	}
 }

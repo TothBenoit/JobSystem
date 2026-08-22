@@ -41,6 +41,7 @@ namespace Job
 		Counter  operator+(const Counter& other);
 
 		uint32_t GetValue() const;
+		void     Reset();
 
 	private:
 		friend class JobBuilder;
